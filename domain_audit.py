@@ -9,6 +9,8 @@ CLI tool to audit domains:
 - DNS A/AAAA + reverse DNS
 - HTTP/HTTPS redirect chains + key headers
 - TLS certificate subject/issuer/SAN
+- IP-RDAP (owner/org of the resolved IP; good customer-friendly "where is it hosted")
+
 Outputs:
 - CSV (Excel-friendly)
 - JSON (full raw details per domain)
@@ -33,6 +35,8 @@ from typing import Any, Dict, List, Tuple
 import requests
 
 IANA_RDAP_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
+DENIC_RDAP_BASE = "https://rdap.denic.de"   # Useful for .de domains
+RIPE_IP_RDAP_BASE = "https://rdap.db.ripe.net"  # Works well for many EU IP ranges
 
 # --- Helpers -----------------------------------------------------------------
 
@@ -84,7 +88,7 @@ def read_domains(path: Path) -> List[str]:
         return domains
 
 
-# --- RDAP --------------------------------------------------------------------
+# --- RDAP (Domain) -----------------------------------------------------------
 
 class RdapBootstrap:
     def __init__(self, session: requests.Session):
@@ -112,10 +116,32 @@ class RdapBootstrap:
 
 
 def rdap_domain_lookup(session: requests.Session, bootstrap: RdapBootstrap, domain_ascii: str) -> Dict[str, Any]:
+    """
+    Domain RDAP lookup.
+    Note: Some ccTLDs (e.g. .de) may not be in the IANA bootstrap file. For .de we try DENIC directly.
+    """
     tld = split_tld(domain_ascii)
+
+    # Special-case: .de via DENIC RDAP
+    if tld == "de":
+        url = f"{DENIC_RDAP_BASE}/domain/{domain_ascii}"
+        try:
+            r = session.get(url, timeout=20, headers={"Accept": "application/rdap+json, application/json"})
+            if r.status_code == 404:
+                return {"error": "RDAP: domain not found", "rdap_url": url, "status_code": 404}
+            r.raise_for_status()
+            data = r.json()
+            data["_rdap_url"] = url
+            return data
+        except Exception as e:
+            # fallback to bootstrap (if any), otherwise return error below
+            denic_err = str(e)
+    else:
+        denic_err = None
+
     bases = bootstrap.rdap_base_urls_for_tld(tld)
     if not bases:
-        return {"error": f"No RDAP bootstrap entry for TLD: {tld}"}
+        return {"error": f"No RDAP bootstrap entry for TLD: {tld}" + (f" (DENIC error: {denic_err})" if denic_err else "")}
 
     last_err = None
     for base in bases:
@@ -141,10 +167,14 @@ def extract_rdap_fields(rdap: Dict[str, Any]) -> Dict[str, str]:
         "rdap_registrant_org": "",
         "rdap_nameservers": "",
         "rdap_status": "",
+        "rdap_url": "",
     }
     if not rdap or "error" in rdap:
         out["rdap_status"] = rdap.get("error", "")
+        out["rdap_url"] = rdap.get("rdap_url", "") or rdap.get("_rdap_url", "")
         return out
+
+    out["rdap_url"] = rdap.get("_rdap_url", "")
 
     # Nameservers
     nss = []
@@ -196,6 +226,52 @@ def extract_rdap_fields(rdap: Dict[str, Any]) -> Dict[str, str]:
     out["rdap_registrant"] = safe_join(sorted(set([x for x in registrant_names if x])))
     out["rdap_registrant_org"] = safe_join(sorted(set([x for x in registrant_orgs if x])))
     return out
+
+
+# --- RDAP (IP) ---------------------------------------------------------------
+
+def ip_rdap_lookup(session: requests.Session, ip: str) -> Dict[str, Any]:
+    """
+    IP RDAP lookup (good for "Hosting-Anbieter" / IP-owner).
+    We use RIPE's RDAP endpoint as a practical default for many European IP ranges.
+    """
+    url = f"{RIPE_IP_RDAP_BASE}/ip/{ip}"
+    try:
+        r = session.get(url, timeout=20, headers={"Accept": "application/rdap+json, application/json"})
+        if r.status_code == 404:
+            return {"error": "IP RDAP: not found", "ip_rdap_url": url, "status_code": 404}
+        r.raise_for_status()
+        data = r.json()
+        data["_ip_rdap_url"] = url
+        return data
+    except Exception as e:
+        return {"error": str(e), "ip_rdap_url": url}
+
+
+def extract_ip_owner(ip_rdap: Dict[str, Any]) -> str:
+    if not ip_rdap or "error" in ip_rdap:
+        return ""
+
+    # 1) Try entities vCard: org / fn
+    owners: List[str] = []
+    for ent in (ip_rdap.get("entities") or []):
+        vcard = ent.get("vcardArray")
+        if not vcard or len(vcard) < 2:
+            continue
+        for entry in vcard[1]:
+            if len(entry) >= 4 and entry[0] in ("org", "fn"):
+                val = str(entry[3]).strip()
+                if val:
+                    owners.append(val)
+
+    owners = sorted(set(owners))
+    if owners:
+        return safe_join(owners)
+
+    # 2) Fallback: name / handle (less pretty, but sometimes helpful)
+    name = str(ip_rdap.get("name") or "").strip()
+    handle = str(ip_rdap.get("handle") or "").strip()
+    return safe_join([x for x in [name, handle] if x])
 
 
 # --- DNS ---------------------------------------------------------------------
@@ -272,28 +348,36 @@ def tls_cert_info(hostname_ascii: str, port: int = 443) -> Dict[str, str]:
 
 # --- Provider heuristics -----------------------------------------------------
 
-def detect_provider(nameservers: str, server_header: str, tls_issuer: str, rdns: str) -> str:
+def detect_provider(nameservers: str, server_header: str, tls_issuer: str, rdns: str, ip_owner: str) -> str:
     """
     Best-effort "human" provider label based on common indicators.
     Not guaranteed to be correct.
     """
-    hay = " | ".join([nameservers, server_header, tls_issuer, rdns]).lower()
+    hay = " | ".join([nameservers, server_header, tls_issuer, rdns, ip_owner]).lower()
 
     rules = [
-        ("cloudflare", "Cloudflare (DNS/CDN)"),
+        # Very common & customer-friendly
+        ("your-server.de", "Hetzner (Hosting)"),
+        ("hetzner", "Hetzner (Hosting)"),
+        ("internet1.de", "IONOS / 1&1 (Hosting)"),
+        ("1and1", "IONOS / 1&1 (Hosting)"),
         ("ui-dns", "IONOS (DNS)"),
-        ("1and1", "IONOS (legacy)"),
-        ("amazonaws", "AWS (Route53/ELB/CloudFront)"),
-        ("awsglobalaccelerator", "AWS (Global Accelerator)"),
-        ("azure", "Microsoft Azure"),
-        ("google", "Google Cloud / Google Domains"),
-        ("gcore", "Gcore"),
-        ("fastly", "Fastly"),
-        ("akamai", "Akamai"),
-        ("stackpathdns", "StackPath"),
-        ("digitalocean", "DigitalOcean"),
-        ("netcup", "netcup"),
-        ("hetzner", "Hetzner"),
+
+        ("cloudflare", "Cloudflare (DNS/CDN)"),
+        ("fastly", "Fastly (CDN)"),
+        ("akamai", "Akamai (CDN)"),
+        ("gcore", "Gcore (CDN)"),
+        ("stackpath", "StackPath (CDN)"),
+
+        ("amazonaws", "AWS (Hosting/CDN)"),
+        ("cloudfront", "AWS CloudFront (CDN)"),
+        ("azure", "Microsoft Azure (Hosting)"),
+        ("google", "Google Cloud (Hosting/DNS)"),
+
+        ("digitalocean", "DigitalOcean (Hosting)"),
+        ("netcup", "netcup (Hosting)"),
+        ("hetzner online", "Hetzner (Hosting)"),
+        ("ionos", "IONOS / 1&1 (Hosting)"),
     ]
 
     for needle, label in rules:
@@ -310,7 +394,9 @@ class DomainResult:
     domain_ascii: str
     tld: str
 
-    provider_guess: str
+    # Customer-friendly summary fields
+    hosting_ip_owner: str         # From IP-RDAP (best "where is it hosted?")
+    hosting_provider_guess: str   # Heuristic fallback/label
 
     a_records: str
     aaaa_records: str
@@ -321,6 +407,7 @@ class DomainResult:
     rdap_registrant_org: str
     rdap_nameservers: str
     rdap_status: str
+    rdap_url: str
 
     http_final_url: str
     http_status: str
@@ -346,10 +433,10 @@ class DomainResult:
 # --- Main --------------------------------------------------------------------
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Domain audit: RDAP + DNS + redirects + TLS. Outputs CSV + JSON.")
+    ap = argparse.ArgumentParser(description="Domain audit: RDAP + DNS + redirects + TLS + IP owner. Outputs CSV + JSON.")
     ap.add_argument("--in", dest="infile", required=True, help="Input file (.txt or .json) with domains")
     ap.add_argument("--out", dest="outdir", default="out", help="Output directory")
-    ap.add_argument("--user-agent", dest="ua", default="domain-audit/1.1", help="HTTP User-Agent")
+    ap.add_argument("--user-agent", dest="ua", default="domain-audit/1.2", help="HTTP User-Agent")
     args = ap.parse_args()
 
     infile = Path(args.infile)
@@ -382,6 +469,15 @@ def main() -> int:
         rdns_list = [reverse_dns(ip) for ip in (a[:3] + aaaa[:3])]
         rdns = safe_join([x for x in rdns_list if x])
 
+        # IP owner (best customer-friendly "where hosted?")
+        ip_rdap_raw: Dict[str, Any] = {}
+        hosting_ip_owner = ""
+        hosting_ip_rdap_url = ""
+        if a:
+            ip_rdap_raw = ip_rdap_lookup(session, a[0])
+            hosting_ip_owner = extract_ip_owner(ip_rdap_raw)
+            hosting_ip_rdap_url = ip_rdap_raw.get("_ip_rdap_url") or ip_rdap_raw.get("ip_rdap_url") or ""
+
         rdap_raw = rdap_domain_lookup(session, bootstrap, d_ascii)
         rdap_fields = extract_rdap_fields(rdap_raw)
 
@@ -389,11 +485,12 @@ def main() -> int:
         https = fetch_url(session, f"https://{d_ascii}")
         tls = tls_cert_info(d_ascii)
 
-        provider_guess = detect_provider(
+        hosting_provider_guess = detect_provider(
             nameservers=rdap_fields.get("rdap_nameservers", ""),
-            server_header=safe_join([http.get("server",""), https.get("server","")]),
-            tls_issuer=tls.get("tls_issuer",""),
+            server_header=safe_join([http.get("server", ""), https.get("server", "")]),
+            tls_issuer=tls.get("tls_issuer", ""),
             rdns=rdns,
+            ip_owner=hosting_ip_owner,
         )
 
         scanned = now_iso()
@@ -403,7 +500,8 @@ def main() -> int:
             domain_ascii=d_ascii,
             tld=tld,
 
-            provider_guess=provider_guess,
+            hosting_ip_owner=hosting_ip_owner,
+            hosting_provider_guess=hosting_provider_guess,
 
             a_records=safe_join(a),
             aaaa_records=safe_join(aaaa),
@@ -414,6 +512,7 @@ def main() -> int:
             rdap_registrant_org=rdap_fields["rdap_registrant_org"],
             rdap_nameservers=rdap_fields["rdap_nameservers"],
             rdap_status=rdap_fields["rdap_status"],
+            rdap_url=rdap_fields.get("rdap_url", ""),
 
             http_final_url=http.get("final_url", ""),
             http_status=str(http.get("status_code", "")),
@@ -442,12 +541,16 @@ def main() -> int:
             "input_domain": d,
             "domain_ascii": d_ascii,
             "tld": tld,
-            "provider_guess": provider_guess,
+            "hosting_ip_owner": hosting_ip_owner,
+            "hosting_ip_rdap_url": hosting_ip_rdap_url,
+            "hosting_provider_guess": hosting_provider_guess,
             "dns": {"a": a, "aaaa": aaaa, "reverse_dns": [x for x in rdns_list if x]},
             "rdap_raw": rdap_raw,
             "http": http,
             "https": https,
             "tls": tls,
+            # Optional: keep raw IP-RDAP (can be big). Uncomment if you want the raw dump.
+            # "ip_rdap_raw": ip_rdap_raw,
             "scanned_at": scanned,
         })
 
